@@ -75,6 +75,9 @@ function extractXmlTag(xml, tag) {
 
 const CODE_FIELDS = ['script', 'condition', 'advanced_condition', 'html', 'css', 'body', 'template', 'message'];
 
+// In-memory cache: record_name -> full parsed artifact (populated by get_update_set_changes)
+const changeCodeCache = new Map();
+
 function parsePayload(payload, type, targetName) {
   const extracted = {};
   for (const field of CODE_FIELDS) {
@@ -134,8 +137,20 @@ const tools = [
     type: 'function',
     function: {
       name: 'get_update_set_changes',
-      description: 'Fetch ALL code changes (sys_update_xml records) inside the Update Set. Returns the type, name, and extracted code (script, condition, HTML, etc.) for each change.',
+      description: 'Fetch ALL changes in the Update Set. Returns metadata and a short code preview for each change. For records with has_code=true, call get_change_code(record_name) to get the full code.',
       parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_change_code',
+      description: 'Fetch the full code for a single Update Set change by its record_name. Call this once per code-containing record after get_update_set_changes.',
+      parameters: {
+        type: 'object',
+        properties: { record_name: { type: 'string', description: 'The record_name value from get_update_set_changes' } },
+        required: ['record_name'],
+      },
     },
   },
   {
@@ -211,20 +226,40 @@ async function executeTool(name, args) {
         sysparm_fields: 'name,type,payload,action,target_name,category,sys_created_by,sys_updated_on',
         sysparm_limit:  '150',
       });
-      const parsed = changes.map((c) => {
+      const summary = changes.map((c) => {
         const artifact = parsePayload(c.payload, c.type, c.target_name || c.name);
-        return {
-          record_name: c.name,
-          type:        c.type,
-          category:    c.category,
-          action:      c.action,
-          created_by:  typeof c.sys_created_by === 'object' ? c.sys_created_by?.display_value : c.sys_created_by,
-          ...artifact,
+        const meta = {
+          record_name:   c.name,
+          type:          c.type,
+          category:      c.category,
+          action:        c.action,
+          created_by:    typeof c.sys_created_by === 'object' ? c.sys_created_by?.display_value : c.sys_created_by,
+          artifact_name: artifact.name,
+          ...(artifact.when   ? { when: artifact.when }     : {}),
+          ...(artifact.active ? { active: artifact.active } : {}),
+          ...(artifact.table  ? { table: artifact.table }   : {}),
         };
+        // Store full code in cache; expose only a 200-char preview here
+        const codeFields = CODE_FIELDS.filter(f => artifact[f]);
+        if (codeFields.length) {
+          changeCodeCache.set(c.name, artifact);
+          meta.has_code     = true;
+          meta.code_fields  = codeFields;
+          meta.code_preview = artifact[codeFields[0]].slice(0, 200);
+        }
+        return meta;
       });
-      const withCode = parsed.filter(p => CODE_FIELDS.some(f => p[f]));
+      const withCode = summary.filter(p => p.has_code);
       console.log(`     Found ${changes.length} changes, ${withCode.length} contain code`);
-      return JSON.stringify(withCode);
+      return JSON.stringify(summary);
+    }
+
+    case 'get_change_code': {
+      const { record_name } = args;
+      const artifact = changeCodeCache.get(record_name);
+      if (!artifact) return `No code found for record '${record_name}'. Make sure you called get_update_set_changes first.`;
+      console.log(`     Returning full code for: ${record_name}`);
+      return JSON.stringify(artifact);
     }
 
     case 'get_existing_script_include': {
@@ -285,11 +320,14 @@ Review a ServiceNow Update Set and produce a decisional score on whether it is s
    -> Read name, description, scope
    -> Extract any Jira ticket ID from the description (pattern [A-Z]+-[0-9]+, e.g. TT-1234)
 2. Call get_update_set_changes
-   -> Get all code artifacts in the Update Set
-3. For Script Includes referenced in code but NOT in the Update Set, call get_existing_script_include
-4. If a Jira ticket ID was found, call get_jira_ticket
-5. Analyse everything thoroughly
-6. Call post_review_to_update_set ONCE with complete findings
+   -> Returns metadata + short preview for every change
+   -> Identify all records where has_code=true
+3. For EACH record where has_code=true, call get_change_code(record_name) one at a time
+   -> Review the full code thoroughly against the checklist below
+4. For Script Includes referenced in code but NOT in the Update Set, call get_existing_script_include
+5. If a Jira ticket ID was found, call get_jira_ticket
+6. Analyse everything thoroughly
+7. Call post_review_to_update_set ONCE with complete findings
 
 === REVIEW CHECKLIST ===
 
@@ -353,14 +391,37 @@ while (iteration < MAX_ITERATIONS) {
   iteration++;
   console.log(`[${iteration}/${MAX_ITERATIONS}] Calling model...`);
 
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4.1',
-    messages,
-    tools,
-    tool_choice: 'auto',
-    max_tokens: 4096,
-    temperature: 0.1,
-  });
+  let response;
+  try {
+    response = await openai.chat.completions.create({
+      model: 'gpt-4.1',
+      messages,
+      tools,
+      tool_choice: 'auto',
+      max_tokens: 4096,
+      temperature: 0.1,
+    });
+  } catch (apiErr) {
+    if (apiErr?.status === 413 || apiErr?.error?.code === 'tokens_limit_reached') {
+      console.warn('  [WARN] Token limit reached — truncating oldest tool results and retrying...');
+      // Trim the content of all tool messages in-place to at most 3000 chars
+      for (const m of messages) {
+        if (m.role === 'tool' && typeof m.content === 'string' && m.content.length > 3000) {
+          m.content = m.content.slice(0, 3000) + '\n[... TRUNCATED due to token limit ...]';
+        }
+      }
+      response = await openai.chat.completions.create({
+        model: 'gpt-4.1',
+        messages,
+        tools,
+        tool_choice: 'auto',
+        max_tokens: 4096,
+        temperature: 0.1,
+      });
+    } else {
+      throw apiErr;
+    }
+  }
 
   const choice  = response.choices[0];
   const message = choice.message;
