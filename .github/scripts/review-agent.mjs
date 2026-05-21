@@ -1,108 +1,163 @@
-/**
- * AI Code Review Agent
- * Uses GitHub Models API (Copilot) + MCP servers (GitHub, Filesystem)
- * + Jira & ServiceNow REST APIs for full contextual code review.
+﻿/**
+ * AI Update Set Reviewer
+ *
+ * Flow:
+ *  1. Fetch Update Set metadata + all code changes from ServiceNow
+ *  2. Identify any referenced Script Includes for deeper context
+ *  3. Fetch linked Jira ticket for requirements + acceptance criteria
+ *  4. AI (GitHub Models / gpt-4o) reviews all code against best practices
+ *  5. Generates a decisional score (0-100) + PUSH / HOLD / DO NOT PUSH
+ *  6. Posts the full review as work notes back to the Update Set in ServiceNow
  */
 
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import OpenAI from 'openai';
 
-// ── Environment ──────────────────────────────────────────────────────────────
+// ── Environment ───────────────────────────────────────────────────────────────
 const {
   GITHUB_TOKEN,
-  PR_NUMBER,
-  REPO_OWNER,
-  REPO_NAME,
-  WORKSPACE_PATH,
-  SNOW_RECORD,       // ServiceNow record that triggered this review (e.g. CHG0012345)
-  JIRA_URL,
-  JIRA_EMAIL,
-  JIRA_TOKEN,
+  UPDATE_SET_SYS_ID,
+  UPDATE_SET_NAME,
+  JIRA_TICKET,
   SERVICENOW_INSTANCE,
   SERVICENOW_USERNAME,
   SERVICENOW_PASSWORD,
+  JIRA_URL,
+  JIRA_EMAIL,
+  JIRA_TOKEN,
 } = process.env;
 
-if (!GITHUB_TOKEN || !PR_NUMBER || !REPO_OWNER || !REPO_NAME) {
-  console.error('❌ Missing required environment variables.');
+if (!GITHUB_TOKEN || !UPDATE_SET_SYS_ID || !SERVICENOW_INSTANCE || !SERVICENOW_USERNAME || !SERVICENOW_PASSWORD) {
+  console.error('Missing required env vars: GITHUB_TOKEN, UPDATE_SET_SYS_ID, SERVICENOW_INSTANCE, SERVICENOW_USERNAME, SERVICENOW_PASSWORD');
   process.exit(1);
 }
 
-const prNumber = parseInt(PR_NUMBER, 10);
-
-// ── GitHub Models (Copilot) client ───────────────────────────────────────────
-// GitHub Models is OpenAI-compatible and uses GITHUB_TOKEN — no separate key needed.
+// ── GitHub Models (Copilot) client ────────────────────────────────────────────
 const openai = new OpenAI({
   baseURL: 'https://models.inference.ai.azure.com',
   apiKey: GITHUB_TOKEN,
 });
 
-// ── MCP Clients ──────────────────────────────────────────────────────────────
-async function createMCPClient(name, command, args, extraEnv = {}) {
-  const transport = new StdioClientTransport({
-    command,
-    args,
-    env: { ...process.env, ...extraEnv },
+// ── ServiceNow REST helpers ───────────────────────────────────────────────────
+const snowBase = `https://${SERVICENOW_INSTANCE}.service-now.com/api/now`;
+const snowAuth = 'Basic ' + Buffer.from(`${SERVICENOW_USERNAME}:${SERVICENOW_PASSWORD}`).toString('base64');
+
+async function snowGet(path, params = {}) {
+  const url = new URL(`${snowBase}${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: snowAuth, Accept: 'application/json' },
   });
-  const client = new Client({ name, version: '1.0.0' }, { capabilities: {} });
-  await client.connect(transport);
-  return client;
+  if (!res.ok) throw new Error(`SNOW GET ${path} -> HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  return (await res.json()).result;
 }
 
-console.log('🔌 Connecting to MCP servers...');
-
-const githubMCP = await createMCPClient(
-  'github-mcp',
-  'npx',
-  ['-y', '@modelcontextprotocol/server-github'],
-  { GITHUB_PERSONAL_ACCESS_TOKEN: GITHUB_TOKEN }
-);
-
-const fsMCP = await createMCPClient(
-  'fs-mcp',
-  'npx',
-  ['-y', '@modelcontextprotocol/server-filesystem', WORKSPACE_PATH || process.cwd()]
-);
-
-console.log('✅ MCP servers connected.');
-
-// ── Tool registration ─────────────────────────────────────────────────────────
-const { tools: rawGithubTools } = await githubMCP.listTools();
-const { tools: rawFsTools } = await fsMCP.listTools();
-
-/**
- * Convert an MCP tool definition to OpenAI function-calling format.
- * @param {object} tool   - MCP tool descriptor
- * @param {string} prefix - namespace prefix ('github' | 'fs')
- */
-function toOpenAITool(tool, prefix) {
-  return {
-    type: 'function',
-    function: {
-      name: `${prefix}__${tool.name}`,
-      description: tool.description ?? '',
-      parameters: tool.inputSchema ?? { type: 'object', properties: {} },
-    },
-  };
+async function snowPatch(path, body) {
+  const res = await fetch(`${snowBase}${path}`, {
+    method: 'PATCH',
+    headers: { Authorization: snowAuth, 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`SNOW PATCH ${path} -> HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  return (await res.json()).result;
 }
 
-// Custom tools for Jira and ServiceNow (handled inline — no extra MCP server needed)
-const customTools = [
+// ── XML parsing helpers ───────────────────────────────────────────────────────
+function extractXmlTag(xml, tag) {
+  if (!xml) return null;
+  const re = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\/${tag}>`, 'i');
+  const m = xml.match(re);
+  if (!m) return null;
+  return m[1]
+    .replace(/<!\[CDATA\[|\]\]>/g, '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"')
+    .trim();
+}
+
+const CODE_FIELDS = ['script', 'condition', 'advanced_condition', 'html', 'css', 'body', 'template', 'message'];
+
+function parsePayload(payload, type, targetName) {
+  const extracted = {};
+  for (const field of CODE_FIELDS) {
+    const val = extractXmlTag(payload, field);
+    if (val && val.length > 5) extracted[field] = val;
+  }
+  const name   = extractXmlTag(payload, 'name') || targetName;
+  const when   = extractXmlTag(payload, 'when');
+  const active = extractXmlTag(payload, 'active');
+  const table  = extractXmlTag(payload, 'collection');
+  return { type, name,
+    ...(when   ? { when }   : {}),
+    ...(active ? { active } : {}),
+    ...(table  ? { table }  : {}),
+    ...extracted };
+}
+
+// ── Jira helper ───────────────────────────────────────────────────────────────
+function extractADFText(node) {
+  if (!node) return null;
+  if (typeof node === 'string') return node;
+  if (node.type === 'text') return node.text ?? '';
+  if (Array.isArray(node.content)) return node.content.map(extractADFText).filter(Boolean).join(' ');
+  return null;
+}
+
+async function fetchJiraTicket(ticketId) {
+  if (!JIRA_URL || !JIRA_EMAIL || !JIRA_TOKEN) return 'Jira credentials not configured.';
+  const auth = Buffer.from(`${JIRA_EMAIL}:${JIRA_TOKEN}`).toString('base64');
+  const res = await fetch(`${JIRA_URL.replace(/\/$/, '')}/rest/api/3/issue/${encodeURIComponent(ticketId)}`, {
+    headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
+  });
+  if (!res.ok) return `Jira ticket ${ticketId} not found (HTTP ${res.status}).`;
+  const d = await res.json();
+  return JSON.stringify({
+    id: d.key,
+    summary: d.fields?.summary,
+    description: extractADFText(d.fields?.description),
+    acceptanceCriteria: extractADFText(d.fields?.customfield_10016),
+    status: d.fields?.status?.name,
+    priority: d.fields?.priority?.name,
+    type: d.fields?.issuetype?.name,
+  });
+}
+
+// ── Tool definitions ──────────────────────────────────────────────────────────
+const tools = [
   {
     type: 'function',
     function: {
-      name: 'jira__get_ticket',
-      description:
-        'Fetch a Jira ticket by ID (e.g. PROJ-123). Returns summary, description, acceptance criteria, status, and priority. Use this when the PR title or body references a Jira ticket.',
+      name: 'get_update_set_details',
+      description: 'Fetch Update Set metadata: name, description, scope, state, release date, owner. Also inspect the description for Jira ticket IDs (pattern [A-Z]+-[0-9]+).',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_update_set_changes',
+      description: 'Fetch ALL code changes (sys_update_xml records) inside the Update Set. Returns the type, name, and extracted code (script, condition, HTML, etc.) for each change.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_existing_script_include',
+      description: 'Fetch an existing Script Include by name from the ServiceNow instance. Use this to get the full code of a utility/helper referenced by code in the Update Set.',
       parameters: {
         type: 'object',
-        properties: {
-          ticket_id: {
-            type: 'string',
-            description: 'Jira ticket ID, e.g. TT-1234',
-          },
-        },
+        properties: { name: { type: 'string', description: 'Script Include name' } },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_jira_ticket',
+      description: 'Fetch a Jira ticket by ID (e.g. TT-1234). Returns summary, description, acceptance criteria. Use to validate the Update Set meets requirements.',
+      parameters: {
+        type: 'object',
+        properties: { ticket_id: { type: 'string', description: 'Jira ticket ID, e.g. TT-1234' } },
         required: ['ticket_id'],
       },
     },
@@ -110,151 +165,189 @@ const customTools = [
   {
     type: 'function',
     function: {
-      name: 'servicenow__get_incident',
-      description:
-        'Fetch a ServiceNow incident by number (e.g. INC0001234). Returns short_description, state, and priority. Use this when the PR references a SNOW incident.',
+      name: 'post_review_to_update_set',
+      description: 'Post the complete AI review as work notes on the ServiceNow Update Set. Call this ONCE at the very end with all findings.',
       parameters: {
         type: 'object',
         properties: {
-          incident_number: {
-            type: 'string',
-            description: 'ServiceNow incident number, e.g. INC0001234',
+          score: { type: 'number', description: '0-100 decisional score. 90-100=PUSH, 70-89=PUSH WITH MINOR FIXES, 50-69=HOLD FOR REVIEW, 0-49=DO NOT PUSH' },
+          recommendation: { type: 'string', enum: ['PUSH', 'PUSH WITH MINOR FIXES', 'HOLD FOR REVIEW', 'DO NOT PUSH'] },
+          good_points: { type: 'array', items: { type: 'string' }, description: 'What is done well' },
+          issues: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                severity:    { type: 'string', enum: ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'] },
+                location:    { type: 'string', description: 'e.g. "Business Rule: MyRule"' },
+                description: { type: 'string' },
+                suggestion:  { type: 'string', description: 'How to fix, with code snippet if possible' },
+              },
+            },
           },
+          jira_alignment: { type: 'string', description: 'How well the Update Set meets the Jira ticket requirements' },
+          summary:        { type: 'string', description: 'Executive summary: what the US does, overall quality, key findings (2-3 paragraphs)' },
         },
-        required: ['incident_number'],
+        required: ['score', 'recommendation', 'good_points', 'issues', 'summary'],
       },
     },
   },
 ];
 
-const allTools = [
-  ...rawGithubTools.map((t) => toOpenAITool(t, 'github')),
-  ...rawFsTools.map((t) => toOpenAITool(t, 'fs')),
-  ...customTools,
-];
-
 // ── Tool execution ────────────────────────────────────────────────────────────
-async function callMCPTool(toolName, args) {
-  if (toolName.startsWith('github__')) {
-    const name = toolName.slice('github__'.length);
-    const result = await githubMCP.callTool({ name, arguments: args });
-    return result.content?.[0]?.text ?? JSON.stringify(result.content);
-  }
+async function executeTool(name, args) {
+  switch (name) {
 
-  if (toolName.startsWith('fs__')) {
-    const name = toolName.slice('fs__'.length);
-    const result = await fsMCP.callTool({ name, arguments: args });
-    return result.content?.[0]?.text ?? JSON.stringify(result.content);
-  }
+    case 'get_update_set_details': {
+      const record = await snowGet(`/table/sys_update_set/${UPDATE_SET_SYS_ID}`, {
+        sysparm_fields: 'name,description,state,application,sys_created_by,sys_created_on,release_date,sys_scope',
+      });
+      return JSON.stringify(record);
+    }
 
-  if (toolName === 'jira__get_ticket') {
-    return await fetchJiraTicket(args.ticket_id);
-  }
+    case 'get_update_set_changes': {
+      const changes = await snowGet('/table/sys_update_xml', {
+        sysparm_query:  `update_set=${UPDATE_SET_SYS_ID}`,
+        sysparm_fields: 'name,type,payload,action,target_name,category,sys_created_by,sys_updated_on',
+        sysparm_limit:  '150',
+      });
+      const parsed = changes.map((c) => {
+        const artifact = parsePayload(c.payload, c.type, c.target_name || c.name);
+        return {
+          record_name: c.name,
+          type:        c.type,
+          category:    c.category,
+          action:      c.action,
+          created_by:  typeof c.sys_created_by === 'object' ? c.sys_created_by?.display_value : c.sys_created_by,
+          ...artifact,
+        };
+      });
+      const withCode = parsed.filter(p => CODE_FIELDS.some(f => p[f]));
+      console.log(`     Found ${changes.length} changes, ${withCode.length} contain code`);
+      return JSON.stringify(withCode);
+    }
 
-  if (toolName === 'servicenow__get_incident') {
-    return await fetchServiceNowIncident(args.incident_number);
-  }
+    case 'get_existing_script_include': {
+      const results = await snowGet('/table/sys_script_include', {
+        sysparm_query:  `name=${args.name}`,
+        sysparm_fields: 'name,script,description,active,access',
+        sysparm_limit:  '1',
+      });
+      if (!results?.length) return `Script Include '${args.name}' not found.`;
+      const r = results[0];
+      return JSON.stringify({ name: r.name, description: r.description, active: r.active, script: r.script });
+    }
 
-  throw new Error(`Unknown tool: ${toolName}`);
+    case 'get_jira_ticket': {
+      return await fetchJiraTicket(args.ticket_id);
+    }
+
+    case 'post_review_to_update_set': {
+      const { score, recommendation, good_points = [], issues = [], jira_alignment, summary } = args;
+      const badge = { PUSH: '[PASS]', 'PUSH WITH MINOR FIXES': '[WARN]', 'HOLD FOR REVIEW': '[HOLD]', 'DO NOT PUSH': '[FAIL]' }[recommendation] ?? '[?]';
+      const sep = '-'.repeat(60);
+      const goodSection = good_points.length ? good_points.map(g => `  + ${g}`).join('\n') : '  (none noted)';
+      const issueSection = issues.length
+        ? issues.map(i =>
+            `  [${i.severity}] ${i.location}\n  Problem: ${i.description}${i.suggestion ? '\n  Fix:     ' + i.suggestion : ''}`
+          ).join('\n\n')
+        : '  No issues found.';
+
+      const workNote = [
+        `${badge} AI UPDATE SET REVIEW --- Score: ${score}/100 --- ${recommendation}`,
+        sep, '',
+        summary, '',
+        sep, 'WHAT IS GOOD:',
+        goodSection, '',
+        sep, `ISSUES FOUND (${issues.length}):`,
+        issueSection,
+        ...(jira_alignment ? ['', sep, 'JIRA TICKET ALIGNMENT:', `  ${jira_alignment}`] : []),
+        '', sep,
+        `Reviewed by AI (GitHub Copilot / gpt-4o) on ${new Date().toUTCString()}`,
+      ].join('\n');
+
+      await snowPatch(`/table/sys_update_set/${UPDATE_SET_SYS_ID}`, { work_notes: workNote });
+      console.log(`\n  Review posted. Score: ${score}/100 | ${recommendation}`);
+      return `Review posted. Score: ${score}/100, Recommendation: ${recommendation}.`;
+    }
+
+    default:
+      throw new Error(`Unknown tool: ${name}`);
+  }
 }
 
-// ── Jira REST API ─────────────────────────────────────────────────────────────
-async function fetchJiraTicket(ticketId) {
-  if (!JIRA_URL || !JIRA_EMAIL || !JIRA_TOKEN) {
-    return `Jira credentials not configured. Cannot fetch ${ticketId}.`;
-  }
-  const auth = Buffer.from(`${JIRA_EMAIL}:${JIRA_TOKEN}`).toString('base64');
-  const url = `${JIRA_URL.replace(/\/$/, '')}/rest/api/3/issue/${encodeURIComponent(ticketId)}`;
-  const res = await fetch(url, {
-    headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
-  });
-  if (!res.ok) {
-    return `Could not fetch Jira ticket ${ticketId}: HTTP ${res.status}`;
-  }
-  const data = await res.json();
-  return JSON.stringify({
-    id: data.key,
-    summary: data.fields?.summary,
-    description: extractADFText(data.fields?.description),
-    acceptanceCriteria: extractADFText(data.fields?.customfield_10016),
-    status: data.fields?.status?.name,
-    priority: data.fields?.priority?.name,
-    type: data.fields?.issuetype?.name,
-  });
-}
+// ── System Prompt ─────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are a senior ServiceNow architect and code reviewer.
+Review a ServiceNow Update Set and produce a decisional score on whether it is safe to push to production.
 
-/** Recursively extract plain text from Atlassian Document Format (ADF). */
-function extractADFText(node) {
-  if (!node) return null;
-  if (typeof node === 'string') return node;
-  if (node.type === 'text') return node.text ?? '';
-  if (Array.isArray(node.content)) {
-    return node.content.map(extractADFText).filter(Boolean).join(' ');
-  }
-  return null;
-}
+=== REQUIRED WORKFLOW ===
+1. Call get_update_set_details
+   -> Read name, description, scope
+   -> Extract any Jira ticket ID from the description (pattern [A-Z]+-[0-9]+, e.g. TT-1234)
+2. Call get_update_set_changes
+   -> Get all code artifacts in the Update Set
+3. For Script Includes referenced in code but NOT in the Update Set, call get_existing_script_include
+4. If a Jira ticket ID was found, call get_jira_ticket
+5. Analyse everything thoroughly
+6. Call post_review_to_update_set ONCE with complete findings
 
-// ── ServiceNow REST API ───────────────────────────────────────────────────────
-async function fetchServiceNowIncident(incidentNumber) {
-  if (!SERVICENOW_INSTANCE || !SERVICENOW_USERNAME || !SERVICENOW_PASSWORD) {
-    return `ServiceNow credentials not configured. Cannot fetch ${incidentNumber}.`;
-  }
-  const auth = Buffer.from(`${SERVICENOW_USERNAME}:${SERVICENOW_PASSWORD}`).toString('base64');
-  const url = `https://${SERVICENOW_INSTANCE}.service-now.com/api/now/table/incident?sysparm_query=number=${encodeURIComponent(incidentNumber)}&sysparm_fields=number,short_description,description,state,priority&sysparm_limit=1`;
-  const res = await fetch(url, {
-    headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
-  });
-  if (!res.ok) {
-    return `Could not fetch SNOW incident ${incidentNumber}: HTTP ${res.status}`;
-  }
-  const data = await res.json();
-  const record = data.result?.[0];
-  if (!record) return `ServiceNow incident ${incidentNumber} not found.`;
-  return JSON.stringify(record);
-}
+=== REVIEW CHECKLIST ===
 
-// ── System prompt ─────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are a senior code reviewer specialising in TypeScript and JavaScript.
-Your task is to perform a thorough, actionable review of GitHub PR #${prNumber} in ${REPO_OWNER}/${REPO_NAME}.
-${SNOW_RECORD ? `\nThis review was triggered from ServiceNow record **${SNOW_RECORD}**. If it is a Change Request number (CHG...) use servicenow__get_incident (query by number) to fetch it for additional context about the intent of the change.\n` : ''}
+ServiceNow Best Practices:
+- GlideRecord queries must have setLimit(); use encoded queries (never string concat)
+- Client Scripts: no synchronous GlideRecord; must use GlideAjax
+- Script Includes: class-based pattern (Class.create()), correct scope
+- Business Rules: correct trigger (before/after/async); no heavy logic in sync rules
+- No hardcoded sys_ids, URLs, or instance-specific values
+- Proper null checks before accessing object properties
+- No deprecated APIs
 
-## Review areas (cover ALL of them)
-1. **Bugs & Logic Errors** — off-by-one, null/undefined, async/await misuse, unhandled promises, race conditions
-2. **Security (OWASP Top 10)** — injection, broken auth, sensitive data exposure, XSS, insecure dependencies, misconfiguration
-3. **Code Quality** — DRY, naming, cyclomatic complexity, TypeScript strict typing, dead code
-4. **Test Coverage** — missing unit/integration tests, untested edge cases, test quality
-5. **Ticket Validation**
-   - Extract Jira IDs (pattern [A-Z]+-[0-9]+) from the PR title and body → call jira__get_ticket
-   - Extract SNOW numbers (pattern INC[0-9]+) from the PR title and body → call servicenow__get_incident
-   - Verify the code change actually addresses the linked ticket's requirements
+Security (OWASP + ServiceNow):
+- No SQL injection via GlideRecord string concatenation
+- No XSS in UI Pages / Jelly / HTML — escape user input
+- ACLs not bypassed without justification
+- No sensitive data in gs.log(), gs.print()
+- No hardcoded credentials, tokens, or API keys
 
-## Workflow
-1. Call github__get_pull_request to read PR metadata and description
-2. Call github__list_pull_request_files to list changed files
-3. For key files, call fs__read_file to get full context beyond the diff
-4. Fetch any linked Jira tickets or ServiceNow incidents
-5. Post the complete review with github__create_pull_request_review
-   - Use event "REQUEST_CHANGES" if critical/high issues exist, "COMMENT" otherwise
-   - Include inline comments (with path + position) for specific line issues
-   - Include a summary body covering all 5 review areas
+Code Quality:
+- DRY — no duplicated logic that belongs in a utility Script Include
+- Functions are reasonably sized and single-purpose
+- Error handling: try/catch around external calls
+- Consistent naming conventions
+- No dead code or commented-out blocks
 
-## Comment format
-Use severity labels: [CRITICAL] [HIGH] [MEDIUM] [LOW] [INFO]
-Always explain WHY it is an issue and HOW to fix it with a code snippet where possible.`;
+Jira Alignment (if ticket available):
+- Does the code implement what the ticket describes?
+- Are all acceptance criteria addressed?
+- Any over-engineering or missing requirements?
 
-// ── Agent loop ────────────────────────────────────────────────────────────────
+=== SCORING ===
+90-100 -> PUSH
+70-89  -> PUSH WITH MINOR FIXES
+50-69  -> HOLD FOR REVIEW
+0-49   -> DO NOT PUSH
+
+Update Set sys_id: ${UPDATE_SET_SYS_ID}
+${UPDATE_SET_NAME ? `Update Set name: ${UPDATE_SET_NAME}` : ''}
+${JIRA_TICKET ? `Provided Jira ticket: ${JIRA_TICKET}` : '(extract Jira ticket from description if present)'}`;
+
+// ── Agent Loop ────────────────────────────────────────────────────────────────
 const messages = [
   { role: 'system', content: SYSTEM_PROMPT },
   {
     role: 'user',
-    content: `Please review PR #${prNumber} in ${REPO_OWNER}/${REPO_NAME}. Cover all 5 review areas and post the full review as a GitHub PR review.`,
+    content: `Review Update Set${UPDATE_SET_NAME ? ` "${UPDATE_SET_NAME}"` : ''} (sys_id: ${UPDATE_SET_SYS_ID}). Follow the required workflow and post results back to ServiceNow.`,
   },
 ];
 
-const MAX_ITERATIONS = 30;
-let iteration = 0;
+console.log(`\n  AI Update Set Reviewer`);
+console.log(`  Update Set : ${UPDATE_SET_NAME || UPDATE_SET_SYS_ID}`);
+console.log(`  Instance   : ${SERVICENOW_INSTANCE}`);
+if (JIRA_TICKET) console.log(`  Jira Ticket: ${JIRA_TICKET}`);
+console.log();
 
-console.log(`\n🤖 Starting AI Code Review — PR #${prNumber} in ${REPO_OWNER}/${REPO_NAME}\n`);
+const MAX_ITERATIONS = 20;
+let iteration = 0;
 
 while (iteration < MAX_ITERATIONS) {
   iteration++;
@@ -263,58 +356,39 @@ while (iteration < MAX_ITERATIONS) {
   const response = await openai.chat.completions.create({
     model: 'gpt-4o',
     messages,
-    tools: allTools,
+    tools,
     tool_choice: 'auto',
     max_tokens: 4096,
-    temperature: 0.2, // Lower temp for more deterministic reviews
+    temperature: 0.1,
   });
 
-  const choice = response.choices[0];
+  const choice  = response.choices[0];
   const message = choice.message;
   messages.push(message);
 
-  // Model finished — no more tool calls
   if (choice.finish_reason === 'stop' || !message.tool_calls?.length) {
-    console.log('\n✅ Review complete.');
-    if (message.content) {
-      console.log('\nFinal message from model:\n', message.content);
-    }
+    console.log('\n  Agent finished.');
+    if (message.content) console.log('  Note:', message.content);
     break;
   }
 
-  // Execute each tool call in the response
   for (const toolCall of message.tool_calls) {
-    const toolName = toolCall.function.name;
-    let toolArgs;
-    try {
-      toolArgs = JSON.parse(toolCall.function.arguments);
-    } catch {
-      toolArgs = {};
-    }
+    let args = {};
+    try { args = JSON.parse(toolCall.function.arguments); } catch { /* ignore */ }
 
-    console.log(`  → ${toolName}(${JSON.stringify(toolArgs)})`);
+    console.log(`  -> ${toolCall.function.name}(${Object.keys(args).length ? JSON.stringify(args) : ''})`);
 
-    let toolResult;
+    let result;
     try {
-      toolResult = await callMCPTool(toolName, toolArgs);
+      result = await executeTool(toolCall.function.name, args);
     } catch (err) {
-      toolResult = `Error: ${err.message}`;
-      console.error(`  ✗ ${toolResult}`);
+      result = `Error: ${err.message}`;
+      console.error(`     ${result}`);
     }
 
-    messages.push({
-      role: 'tool',
-      tool_call_id: toolCall.id,
-      content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
-    });
+    messages.push({ role: 'tool', tool_call_id: toolCall.id, content: result });
   }
 }
 
-if (iteration >= MAX_ITERATIONS) {
-  console.warn('⚠️  Max iterations reached. Review may be incomplete.');
-}
-
-// ── Cleanup ───────────────────────────────────────────────────────────────────
-await githubMCP.close();
-await fsMCP.close();
-console.log('\n🔌 MCP connections closed.');
+if (iteration >= MAX_ITERATIONS) console.warn('\n  Max iterations reached.');
+console.log('\nDone.');

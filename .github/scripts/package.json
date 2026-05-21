@@ -1,8 +1,8 @@
 {
-  "name": "ai-code-review-agent",
-  "version": "1.0.0",
+  "name": "ai-update-set-reviewer",
+  "version": "2.0.0",
   "type": "module",
-  "description": "MCP-based AI code review agent using GitHub Copilot (GitHub Models API)",
+  "description": "AI-powered ServiceNow Update Set reviewer using GitHub Models (Copilot)",
   "engines": {
     "node": ">=20"
   },
@@ -10,7 +10,6 @@
     "start": "node review-agent.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.11.0",
     "openai": "^4.85.0"
   }
 }
