@@ -21,6 +21,11 @@ on:
         required: false
         type: string
         default: "gpt-4.1"
+      api_endpoint:
+        description: "AI provider base URL (e.g. https://models.inference.ai.azure.com, https://api.anthropic.com/v1, https://api.openai.com/v1). Driven by github.code_review.api_endpoint system property."
+        required: false
+        type: string
+        default: "https://models.inference.ai.azure.com"
 
 jobs:
   review-update-set:
@@ -48,10 +53,12 @@ jobs:
         working-directory: .github/scripts
         env:
           GITHUB_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}
+          AI_API_TOKEN: ${{ secrets.AI_API_TOKEN || secrets.GH_MODELS_TOKEN }}
           UPDATE_SET_SYS_ID: ${{ github.event.inputs.update_set_sys_id }}
           UPDATE_SET_NAME: ${{ github.event.inputs.update_set_name }}
           JIRA_TICKET: ${{ github.event.inputs.jira_ticket }}
           REVIEW_MODEL: ${{ github.event.inputs.model || 'gpt-4.1' }}
+          REVIEW_API_ENDPOINT: ${{ github.event.inputs.api_endpoint || 'https://models.inference.ai.azure.com' }}
           SERVICENOW_INSTANCE: ${{ secrets.SERVICENOW_INSTANCE }}
           SERVICENOW_USERNAME: ${{ secrets.SERVICENOW_USERNAME }}
           SERVICENOW_PASSWORD: ${{ secrets.SERVICENOW_PASSWORD }}

@@ -16,6 +16,9 @@ import OpenAI from 'openai';
 // ── Environment ───────────────────────────────────────────────────────────────
 const {
   GITHUB_TOKEN,
+  AI_API_TOKEN,
+  REVIEW_MODEL,
+  REVIEW_API_ENDPOINT,
   UPDATE_SET_SYS_ID,
   UPDATE_SET_NAME,
   JIRA_TICKET,
@@ -38,15 +41,34 @@ if (!GITHUB_TOKEN || !UPDATE_SET_SYS_ID || !SERVICENOW_INSTANCE || !SERVICENOW_U
   process.exit(1);
 }
 
-// ── GitHub Models client ──────────────────────────────────────────────────────
-const openai = new OpenAI({
-  baseURL: 'https://models.inference.ai.azure.com',
-  apiKey: GITHUB_TOKEN,
-});
+// ── AI client (provider-aware) ────────────────────────────────────────────────
+// The API key: prefer AI_API_TOKEN (set when using non-GitHub-Models providers),
+// fall back to GITHUB_TOKEN (legacy / GitHub Models default).
+const API_KEY      = AI_API_TOKEN || GITHUB_TOKEN;
+const MODEL_ID     = REVIEW_MODEL || 'gpt-4.1';
+const API_ENDPOINT = REVIEW_API_ENDPOINT || 'https://models.inference.ai.azure.com';
 
-// The actual model used — referenced in the review record for audit trail
-const MODEL_ID      = process.env.REVIEW_MODEL || 'gpt-4.1';
-const REVIEW_ENGINE = `GitHub Models / ${MODEL_ID}`;
+// Derive a human-readable provider label for the audit trail.
+function deriveProviderLabel(endpoint, model) {
+  const ep = endpoint.toLowerCase();
+  if (ep.includes('anthropic.com') || model.startsWith('claude'))   return `Anthropic / ${model}`;
+  if (ep.includes('openai.com') && !ep.includes('azure'))           return `OpenAI / ${model}`;
+  if (ep.includes('inference.ai') || ep.includes('azure.com'))      return `GitHub Models / ${model}`;
+  if (ep.includes('googleapis.com') || model.startsWith('gemini'))  return `Google AI / ${model}`;
+  try { return `${new URL(endpoint).hostname} / ${model}`; } catch { return `AI / ${model}`; }
+}
+const REVIEW_ENGINE = deriveProviderLabel(API_ENDPOINT, MODEL_ID);
+
+// Build the OpenAI-compatible client.
+// Anthropic's v1 API uses x-api-key + anthropic-version instead of Bearer auth.
+const clientOptions = { baseURL: API_ENDPOINT, apiKey: API_KEY };
+if (API_ENDPOINT.includes('anthropic.com')) {
+  clientOptions.defaultHeaders = {
+    'x-api-key':          API_KEY,
+    'anthropic-version':  '2023-06-01',
+  };
+}
+const openai = new OpenAI(clientOptions);
 
 // ── ServiceNow REST helpers ───────────────────────────────────────────────────
 const snowBase = `https://${SERVICENOW_INSTANCE}.service-now.com/api/now`;
