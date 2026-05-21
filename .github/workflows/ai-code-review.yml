@@ -5,15 +5,15 @@ on:
   workflow_dispatch:
     inputs:
       update_set_sys_id:
-        description: 'ServiceNow Update Set sys_id to review'
+        description: "ServiceNow Update Set sys_id to review"
         required: true
         type: string
       update_set_name:
-        description: 'Update Set display name (for logging only)'
+        description: "Update Set display name (for logging only)"
         required: false
         type: string
       jira_ticket:
-        description: 'Linked Jira ticket ID (e.g. TT-1234) — extracted from description automatically if blank'
+        description: "Linked Jira ticket ID (e.g. TT-1234) — extracted from description automatically if blank"
         required: false
         type: string
 
@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read   # only needs to checkout the agent script
+      contents: read # only needs to checkout the agent script
 
     steps:
       - name: Checkout repository
@@ -31,8 +31,8 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: "24"
+          cache: "npm"
           cache-dependency-path: .github/scripts/package-lock.json
 
       - name: Install review agent dependencies
@@ -42,7 +42,7 @@ jobs:
       - name: Run AI Update Set Review Agent
         working-directory: .github/scripts
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}
           UPDATE_SET_SYS_ID: ${{ github.event.inputs.update_set_sys_id }}
           UPDATE_SET_NAME: ${{ github.event.inputs.update_set_name }}
           JIRA_TICKET: ${{ github.event.inputs.jira_ticket }}
