@@ -74,6 +74,7 @@ function extractXmlTag(xml, tag) {
 }
 
 const CODE_FIELDS = ['script', 'condition', 'advanced_condition', 'html', 'css', 'body', 'template', 'message'];
+const MAX_CODE_CHARS = 1500;
 
 function parsePayload(payload, type, targetName) {
   const extracted = {};
@@ -222,7 +223,13 @@ async function executeTool(name, args) {
           ...artifact,
         };
       });
-      const withCode = parsed.filter(p => CODE_FIELDS.some(f => p[f]));
+      const withCode = parsed.filter(p => CODE_FIELDS.some(f => p[f])).map(p => {
+        for (const f of CODE_FIELDS) {
+          if (p[f] && p[f].length > MAX_CODE_CHARS)
+            p[f] = p[f].slice(0, MAX_CODE_CHARS) + '\n...[truncated]';
+        }
+        return p;
+      });
       console.log(`     Found ${changes.length} changes, ${withCode.length} contain code`);
       return JSON.stringify(withCode);
     }
@@ -235,7 +242,8 @@ async function executeTool(name, args) {
       });
       if (!results?.length) return `Script Include '${args.name}' not found.`;
       const r = results[0];
-      return JSON.stringify({ name: r.name, description: r.description, active: r.active, script: r.script });
+      const script = r.script?.length > MAX_CODE_CHARS ? r.script.slice(0, MAX_CODE_CHARS) + '\n...[truncated]' : r.script;
+      return JSON.stringify({ name: r.name, description: r.description, active: r.active, script });
     }
 
     case 'get_jira_ticket': {
