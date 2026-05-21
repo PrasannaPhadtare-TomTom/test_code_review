@@ -259,7 +259,7 @@ const tools = [
     type: 'function',
     function: {
       name: 'get_update_set_changes',
-      description: `Fetch ALL changes in the Update Set (up to ${CHANGES_LIMIT}). Returns metadata and a short code preview for each change. For records with has_code=true, call get_change_code(record_name) to get the full code.`,
+      description: `Fetch changes in the Update Set that contain code. Returns metadata + a short preview for each. Call get_change_code(record_name) for each record to get the full code.`,
       parameters: { type: 'object', properties: {} },
     },
   },
@@ -379,14 +379,16 @@ async function executeTool(name, args) {
           changeCodeCache.set(c.name, artifact);
           meta.has_code     = true;
           meta.code_fields  = codeFields;
-          meta.code_preview = artifact[codeFields[0]].slice(0, 200);
+          meta.code_preview = artifact[codeFields[0]].slice(0, 100);
         }
         return meta;
       });
 
       const withCode = summary.filter(p => p.has_code);
       console.log(`     Found ${changes.length} changes, ${withCode.length} contain code`);
-      return JSON.stringify(summary);
+      // Return ONLY code-containing records — non-code records are irrelevant for review
+      // and returning all 100+ records blows the token limit
+      return JSON.stringify(withCode);
     }
 
     case 'get_change_code': {
