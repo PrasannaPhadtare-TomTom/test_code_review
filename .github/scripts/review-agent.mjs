@@ -7,7 +7,7 @@
  *  3. Fetch linked Jira ticket for requirements + acceptance criteria
  *  4. AI (GitHub Models / gpt-4.1) reviews all code against best practices
  *  5. Generates a decisional score (0-100) + PUSH / HOLD / DO NOT PUSH
- *  6. Creates a record in u_code_review table with the full HTML review
+ *  6. Creates a record in u_ai_code_review table with the full HTML review
  *     and also posts a brief work note on the Update Set linking to it
  */
 
@@ -305,7 +305,7 @@ const tools = [
       name: 'post_review_to_update_set',
       description: [
         'Save the complete AI review.',
-        'Creates a record in the u_code_review table with full HTML details,',
+        'Creates a record in the u_ai_code_review table with full HTML details,',
         'then posts a brief work note on the Update Set linking to it.',
         'Call this ONCE at the very end with ALL findings.',
       ].join(' '),
@@ -415,15 +415,15 @@ async function executeTool(name, args) {
       return await fetchJiraTicket(args.ticket_id);
     }
 
-    // ── Main output tool — writes to u_code_review + brief work note ──────────
+    // ── Main output tool — writes to u_ai_code_review + brief work note ────────
     case 'post_review_to_update_set': {
       const { score, recommendation, good_points = [], issues = [], jira_alignment, summary } = args;
 
       // 1. Build HTML review content
       const htmlContent = buildReviewHtml({ score, recommendation, good_points, issues, jira_alignment, summary });
 
-      // 2. Create a record in sn_csm_workspace_u_code_review
-      const reviewRecord = await snowPost('/table/sn_csm_workspace_u_code_review', {
+      // 2. Create a record in u_ai_code_review
+      const reviewRecord = await snowPost('/table/u_ai_code_review', {
         u_update_set:        UPDATE_SET_SYS_ID,
         u_review_engine:     REVIEW_ENGINE,
         u_description:       htmlContent.slice(0, 8000), // field max_length is 8000
@@ -431,7 +431,7 @@ async function executeTool(name, args) {
       });
 
       const reviewSysId = reviewRecord?.sys_id ?? 'unknown';
-      console.log(`     u_code_review record created: ${reviewSysId}`);
+      console.log(`     u_ai_code_review record created: ${reviewSysId}`);
 
       // 3. Post a brief work note on the Update Set itself so it shows in the activity stream
       const badge = { PUSH: '[PASS]', 'PUSH WITH MINOR FIXES': '[WARN]', 'HOLD FOR REVIEW': '[HOLD]', 'DO NOT PUSH': '[FAIL]' }[recommendation] ?? '[?]';
@@ -443,9 +443,9 @@ async function executeTool(name, args) {
 
       await snowPatch(`/table/sys_update_set/${UPDATE_SET_SYS_ID}`, { work_notes: briefNote });
 
-      console.log(`\n  Review posted. Score: ${score}/100 | ${recommendation} | u_code_review: ${reviewSysId}`);
+      console.log(`\n  Review posted. Score: ${score}/100 | ${recommendation} | u_ai_code_review: ${reviewSysId}`);
       reviewPosted = true;
-      return `Review saved to u_code_review (sys_id: ${reviewSysId}). Score: ${score}/100, Recommendation: ${recommendation}.`;
+      return `Review saved to u_ai_code_review (sys_id: ${reviewSysId}). Score: ${score}/100, Recommendation: ${recommendation}.`;
     }
 
     default:
