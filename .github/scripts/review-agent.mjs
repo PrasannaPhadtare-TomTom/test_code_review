@@ -354,7 +354,7 @@ while (iteration < MAX_ITERATIONS) {
   console.log(`[${iteration}/${MAX_ITERATIONS}] Calling model...`);
 
   const response = await openai.chat.completions.create({
-    model: 'gpt-4.1',
+    model: 'gpt-4o',
     messages,
     tools,
     tool_choice: 'auto',
