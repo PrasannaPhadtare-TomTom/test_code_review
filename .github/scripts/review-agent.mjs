@@ -420,14 +420,11 @@ async function executeTool(name, args) {
       // 1. Build HTML review content
       const htmlContent = buildReviewHtml({ score, recommendation, good_points, issues, jira_alignment, summary });
 
-      // 2. Create a record in u_code_review
-      const reviewRecord = await snowPost('/table/u_code_review', {
-        u_update_set:   UPDATE_SET_SYS_ID,
-        u_review_engine: REVIEW_ENGINE,
-        u_score:         score,
-        u_recommendation: recommendation,
-        u_description:   htmlContent,
-        // Override fields default to empty/false — filled manually by a human if needed
+      // 2. Create a record in sn_csm_workspace_u_code_review
+      const reviewRecord = await snowPost('/table/sn_csm_workspace_u_code_review', {
+        u_update_set:        UPDATE_SET_SYS_ID,
+        u_review_engine:     REVIEW_ENGINE,
+        u_description:       htmlContent.slice(0, 8000), // field max_length is 8000
         u_emergency_override: false,
       });
 
