@@ -384,6 +384,29 @@ console.log(`  Instance   : ${SERVICENOW_INSTANCE}`);
 if (JIRA_TICKET) console.log(`  Jira Ticket: ${JIRA_TICKET}`);
 console.log();
 
+// ── Context management ────────────────────────────────────────────────────────
+// Once the model produces a new assistant message it has already consumed the
+// tool results from the previous round. Replacing those results with a short
+// placeholder keeps the running context well below the 8k-token ceiling no
+// matter how many records/script-includes are fetched.
+function compressConsumedToolResults(messages) {
+  const lastIdx = messages.length - 1;
+  if (messages[lastIdx]?.role !== 'assistant') return;
+
+  // Find the previous assistant message — everything between it and the new
+  // assistant message are tool results that have just been consumed.
+  let prevAssistantIdx = -1;
+  for (let i = lastIdx - 1; i >= 0; i--) {
+    if (messages[i].role === 'assistant') { prevAssistantIdx = i; break; }
+  }
+
+  for (let i = prevAssistantIdx + 1; i < lastIdx; i++) {
+    if (messages[i].role === 'tool' && typeof messages[i].content === 'string' && messages[i].content.length > 100) {
+      messages[i].content = '[processed by model — content removed to save context]';
+    }
+  }
+}
+
 const MAX_ITERATIONS = 20;
 let iteration = 0;
 
@@ -404,10 +427,10 @@ while (iteration < MAX_ITERATIONS) {
   } catch (apiErr) {
     if (apiErr?.status === 413 || apiErr?.error?.code === 'tokens_limit_reached') {
       console.warn('  [WARN] Token limit reached — truncating oldest tool results and retrying...');
-      // Trim the content of all tool messages in-place to at most 3000 chars
+      // Last-resort emergency truncation — compress everything down to 800 chars
       for (const m of messages) {
-        if (m.role === 'tool' && typeof m.content === 'string' && m.content.length > 3000) {
-          m.content = m.content.slice(0, 3000) + '\n[... TRUNCATED due to token limit ...]';
+        if (m.role === 'tool' && typeof m.content === 'string' && m.content.length > 800) {
+          m.content = m.content.slice(0, 800) + '\n[... TRUNCATED due to token limit ...]';
         }
       }
       response = await openai.chat.completions.create({
@@ -426,6 +449,8 @@ while (iteration < MAX_ITERATIONS) {
   const choice  = response.choices[0];
   const message = choice.message;
   messages.push(message);
+  // Compress tool results from the round just consumed to free context for the next call
+  compressConsumedToolResults(messages);
 
   if (choice.finish_reason === 'stop' || !message.tool_calls?.length) {
     console.log('\n  Agent finished.');
