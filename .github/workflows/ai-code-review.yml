@@ -16,6 +16,11 @@ on:
         description: "Linked Jira ticket ID (e.g. TT-1234) — extracted from description automatically if blank"
         required: false
         type: string
+      model:
+        description: "AI model to use (e.g. gpt-4.1, gpt-4o, o4-mini). Defaults to the github.code_review.model system property value."
+        required: false
+        type: string
+        default: "gpt-4.1"
 
 jobs:
   review-update-set:
@@ -46,6 +51,7 @@ jobs:
           UPDATE_SET_SYS_ID: ${{ github.event.inputs.update_set_sys_id }}
           UPDATE_SET_NAME: ${{ github.event.inputs.update_set_name }}
           JIRA_TICKET: ${{ github.event.inputs.jira_ticket }}
+          REVIEW_MODEL: ${{ github.event.inputs.model || 'gpt-4.1' }}
           SERVICENOW_INSTANCE: ${{ secrets.SERVICENOW_INSTANCE }}
           SERVICENOW_USERNAME: ${{ secrets.SERVICENOW_USERNAME }}
           SERVICENOW_PASSWORD: ${{ secrets.SERVICENOW_PASSWORD }}

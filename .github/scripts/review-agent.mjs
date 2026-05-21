@@ -45,8 +45,8 @@ const openai = new OpenAI({
 });
 
 // The actual model used — referenced in the review record for audit trail
-const REVIEW_ENGINE = 'GitHub Models / gpt-4.1';
-const MODEL_ID      = 'gpt-4.1';
+const MODEL_ID      = process.env.REVIEW_MODEL || 'gpt-4.1';
+const REVIEW_ENGINE = `GitHub Models / ${MODEL_ID}`;
 
 // ── ServiceNow REST helpers ───────────────────────────────────────────────────
 const snowBase = `https://${SERVICENOW_INSTANCE}.service-now.com/api/now`;
