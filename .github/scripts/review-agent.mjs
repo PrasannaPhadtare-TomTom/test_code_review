@@ -15,6 +15,7 @@ const {
   REPO_OWNER,
   REPO_NAME,
   WORKSPACE_PATH,
+  SNOW_RECORD,       // ServiceNow record that triggered this review (e.g. CHG0012345)
   JIRA_URL,
   JIRA_EMAIL,
   JIRA_TOKEN,
@@ -215,6 +216,7 @@ async function fetchServiceNowIncident(incidentNumber) {
 // ── System prompt ─────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are a senior code reviewer specialising in TypeScript and JavaScript.
 Your task is to perform a thorough, actionable review of GitHub PR #${prNumber} in ${REPO_OWNER}/${REPO_NAME}.
+${SNOW_RECORD ? `\nThis review was triggered from ServiceNow record **${SNOW_RECORD}**. If it is a Change Request number (CHG...) use servicenow__get_incident (query by number) to fetch it for additional context about the intent of the change.\n` : ''}
 
 ## Review areas (cover ALL of them)
 1. **Bugs & Logic Errors** — off-by-one, null/undefined, async/await misuse, unhandled promises, race conditions
