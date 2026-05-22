@@ -168,6 +168,7 @@ function extractADFText(node) {
   return null;
 }
 
+
 async function fetchJiraTicket(ticketId) {
   if (!JIRA_URL || !JIRA_EMAIL || !JIRA_TOKEN) return 'Jira credentials not configured.';
   // NOTE: jiraAuth is intentionally never logged
@@ -214,15 +215,30 @@ function buildReviewHtml({ score, recommendation, good_points = [], issues = [],
   const escHtml = s => String(s ?? '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-  const issueRows = issues.map(i => `
-    <tr>
-      <td style="padding:6px 10px;white-space:nowrap">
-        <strong style="color:${severityColour[i.severity] ?? '#333'}">${escHtml(i.severity)}</strong>
-      </td>
-      <td style="padding:6px 10px">${escHtml(i.location)}</td>
-      <td style="padding:6px 10px">${escHtml(i.description)}</td>
-      <td style="padding:6px 10px;font-family:monospace;font-size:0.85em">${escHtml(i.suggestion ?? '')}</td>
-    </tr>`).join('');
+  const SNIPPET_MAX = 350;
+  const clip = (s) => s && s.length > SNIPPET_MAX ? s.slice(0, SNIPPET_MAX) + '\n\u2026' : s;
+  const codeBlock = (bg, border, label, code) =>
+    `<div style="background:${bg};border-left:3px solid ${border};padding:8px 10px;` +
+    `margin:6px 0 0;font-family:monospace;font-size:0.82em;white-space:pre-wrap;overflow-wrap:anywhere">` +
+    `<span style="font-family:sans-serif;font-size:0.9em;font-weight:bold">${label}</span>\n${escHtml(code)}</div>`;
+
+  const issueCards = issues.map(i => {
+    const sc      = severityColour[i.severity] ?? '#555';
+    const snippet = clip(i.code_snippet);
+    const fixed   = clip(i.fixed_snippet);
+    return `
+    <div style="border:1px solid #e0e0e0;border-radius:4px;margin-bottom:10px;overflow:hidden">
+      <div style="background:${sc};color:#fff;padding:7px 12px;font-size:0.9em">
+        <strong>${escHtml(i.severity)}</strong> &mdash; ${escHtml(i.location)}
+      </div>
+      <div style="padding:10px 12px">
+        <p style="margin:0 0 6px">${escHtml(i.description)}</p>
+        ${snippet ? codeBlock('#fff5f5', '#e88', '\u274c Problematic:', snippet) : ''}
+        ${fixed   ? codeBlock('#f5fff8', '#6c6', '\u2705 Fixed:',       fixed)   : ''}
+        ${i.suggestion && !fixed ? `<p style="margin:6px 0 0;font-size:0.88em;color:#555"><em>${escHtml(i.suggestion)}</em></p>` : ''}
+      </div>
+    </div>`;
+  }).join('');
 
   const goodItems = good_points.map(g => `<li>${escHtml(g)}</li>`).join('');
 
@@ -242,18 +258,7 @@ function buildReviewHtml({ score, recommendation, good_points = [], issues = [],
   <ul>${goodItems || '<li><em>None noted</em></li>'}</ul>
 
   <h3>Issues Found (${issues.length})</h3>
-  ${issues.length ? `
-  <table style="width:100%;border-collapse:collapse;border:1px solid #ddd">
-    <thead style="background:#f5f5f5">
-      <tr>
-        <th style="padding:6px 10px;text-align:left">Severity</th>
-        <th style="padding:6px 10px;text-align:left">Location</th>
-        <th style="padding:6px 10px;text-align:left">Problem</th>
-        <th style="padding:6px 10px;text-align:left">Suggestion / Fix</th>
-      </tr>
-    </thead>
-    <tbody>${issueRows}</tbody>
-  </table>` : '<p><em>No issues found.</em></p>'}
+  ${issues.length ? issueCards : '<p><em>No issues found.</em></p>'}
 
   ${jira_alignment ? `
   <h3>Jira Ticket Alignment</h3>
@@ -342,15 +347,17 @@ const tools = [
             items: {
               type: 'object',
               properties: {
-                severity:    { type: 'string', enum: ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'] },
-                location:    { type: 'string', description: 'e.g. "Business Rule: MyRule"' },
-                description: { type: 'string' },
-                suggestion:  { type: 'string', description: 'How to fix, with code snippet if possible' },
+                severity:      { type: 'string', enum: ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'] },
+                location:      { type: 'string', description: 'Exact artifact type + name, e.g. "Business Rule: ValidateCase" or "Script Include: CaseUtils — processRequest()"' },
+                description:   { type: 'string', description: 'Specific problem naming the exact variable/function/line involved — never generic' },
+                code_snippet:  { type: 'string', description: 'The exact problematic lines copied verbatim from get_change_code output. Required for CRITICAL/HIGH/MEDIUM.' },
+                fixed_snippet: { type: 'string', description: 'The corrected code showing exactly what to write instead. Write actual code, not advice.' },
+                suggestion:    { type: 'string', description: 'Additional context or explanation if needed beyond fixed_snippet' },
               },
             },
           },
           jira_alignment: { type: 'string', description: 'How well the Update Set meets the Jira ticket requirements' },
-          summary:        { type: 'string', description: 'Executive summary: what the US does, overall quality, key findings (2-3 paragraphs)' },
+          summary:        { type: 'string', description: 'Executive summary (2-3 paragraphs): (1) what each changed artifact does, named explicitly; (2) overall quality with specific evidence from the code — quote artifact names and observations; (3) top findings. Never use generic phrases like "overall good quality" without supporting specifics.' },
         },
         required: ['score', 'recommendation', 'good_points', 'issues', 'summary'],
       },
@@ -528,6 +535,31 @@ Jira Alignment (if ticket available):
 70-89  -> PUSH WITH MINOR FIXES
 50-69  -> HOLD FOR REVIEW
 0-49   -> DO NOT PUSH
+
+=== EVIDENCE RULES (mandatory — vague findings will waste the reviewer's time) ===
+Every issue you report MUST follow ALL of these rules:
+
+1. code_snippet: Paste the EXACT lines verbatim from what get_change_code returned.
+   Never paraphrase. Never invent. Copy-paste only.
+
+2. fixed_snippet: Write the corrected code showing exactly what to type instead.
+   WRONG: "Add a null check before accessing the property"
+   RIGHT: paste the corrected 3-5 lines with the null check actually written in
+
+3. location: Include artifact type + exact name + function if applicable.
+   WRONG: "Business Rule"
+   RIGHT: "Business Rule: ValidateCase — before insert on incident"
+
+4. description: Name the exact variable/function/API call involved.
+   WRONG: "Missing error handling"
+   RIGHT: "rm.execute() on line 12 has no try/catch — any HTTP timeout will crash the Business Rule and silently fail the transaction"
+
+5. Do NOT invent issues. If the code is clean, say so clearly and score it high.
+   INFO severity = observation only, no action required. Use sparingly (0-2 max).
+
+6. summary must name each artifact reviewed and cite specific observations.
+   WRONG: "The Update Set follows good practices overall."
+   RIGHT: "The Business Rule 'ValidateCase' correctly uses encoded queries but calls gr.getValue() without checking isValidRecord(). The Script Include 'CaseUtils' is well-structured with proper Class.create() pattern, though processRequest() lacks try/catch around the REST call on line 34."
 
 Update Set sys_id: ${UPDATE_SET_SYS_ID}
 ${UPDATE_SET_NAME ? `Update Set name: ${UPDATE_SET_NAME}` : ''}
