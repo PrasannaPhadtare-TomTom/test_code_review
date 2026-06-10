@@ -446,6 +446,44 @@ function buildChunkPlan(issues) {
   return groups;
 }
 
+function hasUnresolvedDependencyIssue(issues) {
+  return (issues || []).some((i) => {
+    const location = String(i?.location || '').toLowerCase();
+    const description = String(i?.description || '').toLowerCase();
+    const suggestion = String(i?.suggestion || '').toLowerCase();
+    const text = `${location} ${description} ${suggestion}`;
+    return (
+      text.includes('not found in the instance') ||
+      text.includes('not found in instance') ||
+      text.includes('referenced but not present') ||
+      text.includes('script include') && text.includes('not found')
+    );
+  });
+}
+
+function applyRecommendationGuards({ score, recommendation, issues, summary }) {
+  let guardedScore = Number(score);
+  let guardedRecommendation = recommendation;
+  const guardNotes = [];
+
+  // Hard guard: unresolved dependencies should never be approved as PUSH.
+  if (hasUnresolvedDependencyIssue(issues) && guardedRecommendation === 'PUSH') {
+    guardedRecommendation = 'HOLD FOR REVIEW';
+    guardedScore = Math.min(Number.isFinite(guardedScore) ? guardedScore : 69, 69);
+    guardNotes.push('Guard applied: unresolved dependency detected; recommendation downgraded from PUSH to HOLD FOR REVIEW.');
+  }
+
+  const guardedSummary = guardNotes.length
+    ? `${guardNotes.join(' ')}\n\n${summary || ''}`.trim()
+    : summary;
+
+  return {
+    score: Number.isFinite(guardedScore) ? guardedScore : score,
+    recommendation: guardedRecommendation,
+    summary: guardedSummary,
+  };
+}
+
 async function executeTool(name, args) {
   switch (name) {
 
@@ -551,9 +589,20 @@ async function executeTool(name, args) {
     // ── Main output tool — writes to u_ai_code_review + brief work note ────────
     case 'post_review_to_update_set': {
       const { score, recommendation, good_points = [], issues = [], jira_alignment, summary } = args;
+      const guarded = applyRecommendationGuards({ score, recommendation, issues, summary });
+      const finalScore = guarded.score;
+      const finalRecommendation = guarded.recommendation;
+      const finalSummary = guarded.summary;
 
       // 1. Build HTML review content
-      const htmlContent = buildReviewHtml({ score, recommendation, good_points, issues, jira_alignment, summary });
+      const htmlContent = buildReviewHtml({
+        score: finalScore,
+        recommendation: finalRecommendation,
+        good_points,
+        issues,
+        jira_alignment,
+        summary: finalSummary,
+      });
 
       // 2. Persist review in one record or in category-based chunks for large payloads.
       const needsMultiPart = FORCE_CHUNKED || htmlContent.length > 7800 || issues.length > 20;
@@ -581,8 +630,8 @@ async function executeTool(name, args) {
           ].join(' ');
 
           const childHtml = buildReviewHtml({
-            score,
-            recommendation,
+            score: finalScore,
+            recommendation: finalRecommendation,
             good_points: [],
             issues: g.issues,
             jira_alignment,
@@ -611,13 +660,13 @@ async function executeTool(name, args) {
         const childLines = childReviewIds.map((id, i) => `${i + 1}. ${id}`).join('\n');
 
         const summaryHtml = buildReviewHtml({
-          score,
-          recommendation,
+          score: finalScore,
+          recommendation: finalRecommendation,
           good_points,
           issues: [],
           jira_alignment,
           summary: [
-            summary,
+            finalSummary,
             '',
             `This review was split into ${childReviewIds.length} child record(s) due to payload size constraints.`,
             'Issue distribution by artifact category:',
@@ -639,9 +688,9 @@ async function executeTool(name, args) {
       }
 
       // 3. Post a brief work note on the Update Set itself so it shows in the activity stream
-      const badge = { PUSH: '[PASS]', 'PUSH WITH MINOR FIXES': '[WARN]', 'HOLD FOR REVIEW': '[HOLD]', 'DO NOT PUSH': '[FAIL]' }[recommendation] ?? '[?]';
+      const badge = { PUSH: '[PASS]', 'PUSH WITH MINOR FIXES': '[WARN]', 'HOLD FOR REVIEW': '[HOLD]', 'DO NOT PUSH': '[FAIL]' }[finalRecommendation] ?? '[?]';
       const briefNote = [
-        `${badge} AI Code Review complete — Score: ${score}/100 — ${recommendation}`,
+        `${badge} AI Code Review complete — Score: ${finalScore}/100 — ${finalRecommendation}`,
         `Full review details: navigate to Code Reviews and filter by this Update Set (record sys_id: ${reviewSysId}).`,
         ...(childReviewIds.length ? [`Additional child reviews (${childReviewIds.length}): ${childReviewIds.join(', ')}`] : []),
         `Reviewed by: ${REVIEW_ENGINE} on ${new Date().toUTCString()}`,
@@ -649,9 +698,9 @@ async function executeTool(name, args) {
 
       await snowPatch(`/table/sys_update_set/${UPDATE_SET_SYS_ID}`, { work_notes: briefNote });
 
-      console.log(`\n  Review posted. Score: ${score}/100 | ${recommendation} | u_ai_code_review: ${reviewSysId}`);
+      console.log(`\n  Review posted. Score: ${finalScore}/100 | ${finalRecommendation} | u_ai_code_review: ${reviewSysId}`);
       reviewPosted = true;
-      return `Review saved to u_ai_code_review (sys_id: ${reviewSysId}). Score: ${score}/100, Recommendation: ${recommendation}.`;
+      return `Review saved to u_ai_code_review (sys_id: ${reviewSysId}). Score: ${finalScore}/100, Recommendation: ${finalRecommendation}.`;
     }
 
     default:
