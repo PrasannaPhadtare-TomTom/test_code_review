@@ -21,6 +21,8 @@ const {
   REVIEW_API_ENDPOINT,
   FORCE_CHUNKED_REVIEW,
   REVIEW_CHUNK_SIZE,
+  REQUESTED_BY,
+  AI_TOKEN_SOURCE,
   UPDATE_SET_SYS_ID,
   UPDATE_SET_NAME,
   JIRA_TICKET,
@@ -846,6 +848,8 @@ console.log(`  Instance   : ${SERVICENOW_INSTANCE}`);
 console.log(`  Engine     : ${REVIEW_ENGINE}`);
 console.log(`  Chunk Mode : ${FORCE_CHUNKED ? 'FORCED' : 'AUTO'}`);
 console.log(`  Chunk Size : ${CHUNK_SIZE}`);
+if (REQUESTED_BY) console.log(`  Requested By: ${REQUESTED_BY}`);
+if (AI_TOKEN_SOURCE) console.log(`  Token Src  : ${AI_TOKEN_SOURCE}`);
 if (JIRA_TICKET) console.log(`  Jira Ticket: ${JIRA_TICKET}`);
 console.log();
 

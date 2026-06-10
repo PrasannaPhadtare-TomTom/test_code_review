@@ -36,6 +36,14 @@ on:
         required: false
         type: number
         default: 8
+      requested_by:
+        description: "Requester identity from ServiceNow (for audit/logging)."
+        required: false
+        type: string
+      ai_token_secret_name:
+        description: "GitHub secret name holding requester's AI API token (for dynamic per-user token routing)."
+        required: false
+        type: string
 
 jobs:
   review-update-set:
@@ -59,11 +67,38 @@ jobs:
         working-directory: .github/scripts
         run: npm ci
 
+      - name: Resolve AI API token (requester-aware)
+        id: resolve-ai-token
+        env:
+          REQUESTED_SECRET_NAME: ${{ github.event.inputs.ai_token_secret_name }}
+          REQUESTED_SECRET_VALUE: ${{ secrets[github.event.inputs.ai_token_secret_name] }}
+          DEFAULT_AI_API_TOKEN: ${{ secrets.AI_API_TOKEN }}
+          GH_MODELS_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}
+        run: |
+          set -e
+          TOKEN=""
+          TOKEN_SOURCE="none"
+
+          if [ -n "$REQUESTED_SECRET_NAME" ] && [ -n "$REQUESTED_SECRET_VALUE" ]; then
+            TOKEN="$REQUESTED_SECRET_VALUE"
+            TOKEN_SOURCE="requested-secret:$REQUESTED_SECRET_NAME"
+          elif [ -n "$DEFAULT_AI_API_TOKEN" ]; then
+            TOKEN="$DEFAULT_AI_API_TOKEN"
+            TOKEN_SOURCE="default-secret:AI_API_TOKEN"
+          else
+            TOKEN="$GH_MODELS_TOKEN"
+            TOKEN_SOURCE="fallback:GH_MODELS_TOKEN"
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          echo "source=$TOKEN_SOURCE" >> "$GITHUB_OUTPUT"
+
       - name: Run AI Update Set Review Agent
         working-directory: .github/scripts
         env:
           GITHUB_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}
-          AI_API_TOKEN: ${{ secrets.AI_API_TOKEN || secrets.GH_MODELS_TOKEN }}
+          AI_API_TOKEN: ${{ steps.resolve-ai-token.outputs.token }}
           UPDATE_SET_SYS_ID: ${{ github.event.inputs.update_set_sys_id }}
           UPDATE_SET_NAME: ${{ github.event.inputs.update_set_name }}
           JIRA_TICKET: ${{ github.event.inputs.jira_ticket }}
@@ -71,6 +106,8 @@ jobs:
           REVIEW_API_ENDPOINT: ${{ github.event.inputs.api_endpoint || 'https://models.inference.ai.azure.com' }}
           FORCE_CHUNKED_REVIEW: ${{ github.event.inputs.force_chunked_review || false }}
           REVIEW_CHUNK_SIZE: ${{ github.event.inputs.chunk_size || 8 }}
+          REQUESTED_BY: ${{ github.event.inputs.requested_by }}
+          AI_TOKEN_SOURCE: ${{ steps.resolve-ai-token.outputs.source }}
           SERVICENOW_INSTANCE: ${{ secrets.SERVICENOW_INSTANCE }}
           SERVICENOW_USERNAME: ${{ secrets.SERVICENOW_USERNAME }}
           SERVICENOW_PASSWORD: ${{ secrets.SERVICENOW_PASSWORD }}
