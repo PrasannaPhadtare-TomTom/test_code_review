@@ -446,12 +446,49 @@ function buildChunkPlan(issues) {
   return groups;
 }
 
-function hasUnresolvedDependencyIssue(issues) {
+function collectDeclaredSymbolsFromChanges() {
+  const declared = new Set();
+
+  for (const artifact of changeCodeCache.values()) {
+    for (const field of CODE_FIELDS) {
+      const src = artifact?.[field];
+      if (typeof src !== 'string' || !src) continue;
+
+      let m;
+      const fnDecl = /function\s+([A-Za-z_$][\w$]*)\s*\(/g;
+      while ((m = fnDecl.exec(src)) !== null) declared.add(m[1]);
+
+      const classCreateDecl = /var\s+([A-Za-z_$][\w$]*)\s*=\s*Class\.create\s*\(/g;
+      while ((m = classCreateDecl.exec(src)) !== null) declared.add(m[1]);
+
+      const methodDecl = /([A-Za-z_$][\w$]*)\s*:\s*function\s*\(/g;
+      while ((m = methodDecl.exec(src)) !== null) declared.add(m[1]);
+    }
+  }
+
+  return declared;
+}
+
+function extractPotentialMissingSymbol(issue) {
+  const text = `${String(issue?.location || '')} ${String(issue?.description || '')} ${String(issue?.suggestion || '')}`;
+
+  let m = text.match(/script include[^A-Za-z0-9_$]*['\"]?([A-Za-z_$][\w$]*)['\"]?/i);
+  if (m && m[1]) return m[1];
+
+  m = text.match(/['\"]([A-Za-z_$][\w$]*)['\"]\s+is\s+referenced\s+but\s+not\s+present/i);
+  if (m && m[1]) return m[1];
+
+  return null;
+}
+
+function hasUnresolvedDependencyIssue(issues, declaredSymbols) {
   return (issues || []).some((i) => {
     const location = String(i?.location || '').toLowerCase();
     const description = String(i?.description || '').toLowerCase();
     const suggestion = String(i?.suggestion || '').toLowerCase();
     const text = `${location} ${description} ${suggestion}`;
+    const candidate = extractPotentialMissingSymbol(i);
+    if (candidate && declaredSymbols && declaredSymbols.has(candidate)) return false;
     return (
       text.includes('not found in the instance') ||
       text.includes('not found in instance') ||
@@ -465,9 +502,10 @@ function applyRecommendationGuards({ score, recommendation, issues, summary }) {
   let guardedScore = Number(score);
   let guardedRecommendation = recommendation;
   const guardNotes = [];
+  const declaredSymbols = collectDeclaredSymbolsFromChanges();
 
   // Hard guard: unresolved dependencies should never be approved as PUSH.
-  if (hasUnresolvedDependencyIssue(issues) && guardedRecommendation === 'PUSH') {
+  if (hasUnresolvedDependencyIssue(issues, declaredSymbols) && guardedRecommendation === 'PUSH') {
     guardedRecommendation = 'HOLD FOR REVIEW';
     guardedScore = Math.min(Number.isFinite(guardedScore) ? guardedScore : 69, 69);
     guardNotes.push('Guard applied: unresolved dependency detected; recommendation downgraded from PUSH to HOLD FOR REVIEW.');
