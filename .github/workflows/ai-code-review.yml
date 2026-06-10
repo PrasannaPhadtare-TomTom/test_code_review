@@ -26,6 +26,16 @@ on:
         required: false
         type: string
         default: "https://models.inference.ai.azure.com"
+      force_chunked_review:
+        description: "Force multi-part review output (child records + summary) even for medium update sets."
+        required: false
+        type: boolean
+        default: false
+      chunk_size:
+        description: "Issues per child review record when chunking is active (recommended 6-12)."
+        required: false
+        type: number
+        default: 8
 
 jobs:
   review-update-set:
@@ -59,6 +69,8 @@ jobs:
           JIRA_TICKET: ${{ github.event.inputs.jira_ticket }}
           REVIEW_MODEL: ${{ github.event.inputs.model || 'gpt-4.1' }}
           REVIEW_API_ENDPOINT: ${{ github.event.inputs.api_endpoint || 'https://models.inference.ai.azure.com' }}
+          FORCE_CHUNKED_REVIEW: ${{ github.event.inputs.force_chunked_review || false }}
+          REVIEW_CHUNK_SIZE: ${{ github.event.inputs.chunk_size || 8 }}
           SERVICENOW_INSTANCE: ${{ secrets.SERVICENOW_INSTANCE }}
           SERVICENOW_USERNAME: ${{ secrets.SERVICENOW_USERNAME }}
           SERVICENOW_PASSWORD: ${{ secrets.SERVICENOW_PASSWORD }}

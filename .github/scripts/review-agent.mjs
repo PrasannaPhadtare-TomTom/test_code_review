@@ -19,6 +19,8 @@ const {
   AI_API_TOKEN,
   REVIEW_MODEL,
   REVIEW_API_ENDPOINT,
+  FORCE_CHUNKED_REVIEW,
+  REVIEW_CHUNK_SIZE,
   UPDATE_SET_SYS_ID,
   UPDATE_SET_NAME,
   JIRA_TICKET,
@@ -29,6 +31,9 @@ const {
   JIRA_EMAIL,
   JIRA_TOKEN,
 } = process.env;
+
+const FORCE_CHUNKED = ['1', 'true', 'yes', 'on'].includes(String(FORCE_CHUNKED_REVIEW || '').trim().toLowerCase());
+const CHUNK_SIZE = Math.max(2, Math.min(25, parseInt(String(REVIEW_CHUNK_SIZE || '8'), 10) || 8));
 
 // Validate sys_id format before doing anything
 if (UPDATE_SET_SYS_ID && !/^[a-f0-9]{32}$/.test(UPDATE_SET_SYS_ID)) {
@@ -135,6 +140,10 @@ function extractXmlTag(xml, tag) {
 
 const CODE_FIELDS    = ['script', 'condition', 'advanced_condition', 'html', 'css', 'body', 'template', 'message'];
 const CHANGES_LIMIT  = 150; // max records fetched from sys_update_xml in one call
+const CHANGE_PAGE_DEFAULT = 25;
+const CHANGE_PAGE_MAX = 50;
+const CODE_FIELD_MAX_CHARS = 4000;
+const TOOL_RESULT_MAX_CHARS = 18000;
 
 // In-memory cache: record_name -> full parsed artifact
 // Assumption: single-run lifetime only — do not reuse this module across multiple Update Sets
@@ -286,18 +295,27 @@ const tools = [
     type: 'function',
     function: {
       name: 'get_update_set_changes',
-      description: `Fetch changes in the Update Set that contain code. Returns metadata + a short preview for each. Call get_change_code(record_name) for each record to get the full code.`,
-      parameters: { type: 'object', properties: {} },
+      description: `Fetch changes in the Update Set that contain code. Returns a PAGE of metadata + a short preview. Use offset/limit to iterate pages and avoid model token overflow. Call get_change_code(record_name) for each record to get full code.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          offset: { type: 'number', description: '0-based page start index. Default 0.' },
+          limit: { type: 'number', description: `Page size. Default ${CHANGE_PAGE_DEFAULT}, max ${CHANGE_PAGE_MAX}.` },
+        },
+      },
     },
   },
   {
     type: 'function',
     function: {
       name: 'get_change_code',
-      description: 'Fetch the full code for a single Update Set change by its record_name. Call this once per code-containing record after get_update_set_changes.',
+      description: 'Fetch code for a single Update Set change by its record_name. Returns truncated fields by default to reduce token usage.',
       parameters: {
         type: 'object',
-        properties: { record_name: { type: 'string', description: 'The record_name value from get_update_set_changes' } },
+        properties: {
+          record_name: { type: 'string', description: 'The record_name value from get_update_set_changes' },
+          max_chars_per_field: { type: 'number', description: `Optional per-field cap. Default ${CODE_FIELD_MAX_CHARS}.` },
+        },
         required: ['record_name'],
       },
     },
@@ -368,6 +386,65 @@ const tools = [
 // ── Tool execution ────────────────────────────────────────────────────────────
 // Tracks whether post_review_to_update_set was successfully called
 let reviewPosted = false;
+let tokenLimitEvents = 0;
+
+function clampNumber(value, fallback, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function clipText(value, maxChars) {
+  if (typeof value !== 'string') return value;
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n... [TRUNCATED ${value.length - maxChars} chars to control token usage]`;
+}
+
+function normalizeToolResult(toolName, result) {
+  let content = typeof result === 'string' ? result : JSON.stringify(result);
+  const maxChars = toolName === 'get_change_code' ? TOOL_RESULT_MAX_CHARS : Math.floor(TOOL_RESULT_MAX_CHARS * 0.7);
+  if (content.length > maxChars) {
+    content = `${content.slice(0, maxChars)}\n... [TRUNCATED ${content.length - maxChars} chars from tool output to control model context size]`;
+  }
+  return content;
+}
+
+function chunkArray(items, size) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+function artifactCategoryFromLocation(location) {
+  const text = String(location || '').trim();
+  if (!text) return 'Uncategorized';
+  const idx = text.indexOf(':');
+  if (idx <= 0) return 'Uncategorized';
+  return text.slice(0, idx).trim() || 'Uncategorized';
+}
+
+function buildChunkPlan(issues) {
+  const byCategory = new Map();
+  for (const issue of issues) {
+    const key = artifactCategoryFromLocation(issue?.location);
+    if (!byCategory.has(key)) byCategory.set(key, []);
+    byCategory.get(key).push(issue);
+  }
+
+  const groups = [];
+  for (const [category, categoryIssues] of byCategory.entries()) {
+    const parts = chunkArray(categoryIssues, CHUNK_SIZE);
+    parts.forEach((partIssues, idx) => {
+      groups.push({
+        category,
+        part: idx + 1,
+        totalParts: parts.length,
+        issues: partIssues,
+      });
+    });
+  }
+  return groups;
+}
 
 async function executeTool(name, args) {
   switch (name) {
@@ -380,6 +457,8 @@ async function executeTool(name, args) {
     }
 
     case 'get_update_set_changes': {
+      const offset = clampNumber(args.offset, 0, 0, CHANGES_LIMIT);
+      const limit = clampNumber(args.limit, CHANGE_PAGE_DEFAULT, 1, CHANGE_PAGE_MAX);
       const changes = await snowGet('/table/sys_update_xml', {
         sysparm_query:  `update_set=${UPDATE_SET_SYS_ID}`,
         sysparm_fields: 'name,type,payload,action,target_name,category,sys_created_by,sys_updated_on',
@@ -415,18 +494,43 @@ async function executeTool(name, args) {
 
       const withCode = summary.filter(p => p.has_code);
       console.log(`     Found ${changes.length} changes, ${withCode.length} contain code`);
-      // Return ONLY code-containing records — non-code records are irrelevant for review
-      // and returning all 100+ records blows the token limit
-      return JSON.stringify(withCode);
+      // Return ONLY code-containing records and page the result to avoid token overflows.
+      const paged = withCode.slice(offset, offset + limit);
+      const nextOffset = offset + paged.length;
+      const hasMore = nextOffset < withCode.length;
+      return JSON.stringify({
+        total_records: withCode.length,
+        offset,
+        limit,
+        returned: paged.length,
+        has_more: hasMore,
+        next_offset: hasMore ? nextOffset : null,
+        records: paged,
+      });
     }
 
     case 'get_change_code': {
       const { record_name } = args;
+      const maxCharsPerField = clampNumber(args.max_chars_per_field, CODE_FIELD_MAX_CHARS, 500, 12000);
       if (!record_name) return 'Error: record_name is required.';
       const artifact = changeCodeCache.get(record_name);
       if (!artifact) return `No code found for record '${record_name}'. Make sure you called get_update_set_changes first.`;
       console.log(`     Returning full code for: ${record_name}`);
-      return JSON.stringify(artifact);
+      const trimmed = { ...artifact };
+      const truncatedFields = [];
+      for (const field of CODE_FIELDS) {
+        if (typeof trimmed[field] === 'string' && trimmed[field].length > maxCharsPerField) {
+          trimmed[field] = clipText(trimmed[field], maxCharsPerField);
+          truncatedFields.push(field);
+        }
+      }
+      return JSON.stringify({
+        ...trimmed,
+        _meta: {
+          max_chars_per_field: maxCharsPerField,
+          truncated_fields: truncatedFields,
+        },
+      });
     }
 
     case 'get_existing_script_include': {
@@ -451,22 +555,95 @@ async function executeTool(name, args) {
       // 1. Build HTML review content
       const htmlContent = buildReviewHtml({ score, recommendation, good_points, issues, jira_alignment, summary });
 
-      // 2. Create a record in u_ai_code_review
-      const reviewRecord = await snowPost('/table/u_ai_code_review', {
-        u_update_set:        UPDATE_SET_SYS_ID,
-        u_review_engine:     REVIEW_ENGINE,
-        u_description:       htmlContent.slice(0, 8000), // field max_length is 8000
-        u_emergency_override: false,
-      });
+      // 2. Persist review in one record or in category-based chunks for large payloads.
+      const needsMultiPart = FORCE_CHUNKED || htmlContent.length > 7800 || issues.length > 20;
+      let reviewSysId = 'unknown';
+      const childReviewIds = [];
 
-      const reviewSysId = reviewRecord?.sys_id ?? 'unknown';
-      console.log(`     u_ai_code_review record created: ${reviewSysId}`);
+      if (!needsMultiPart) {
+        const reviewRecord = await snowPost('/table/u_ai_code_review', {
+          u_update_set: UPDATE_SET_SYS_ID,
+          u_review_engine: REVIEW_ENGINE,
+          u_description: htmlContent.slice(0, 8000),
+          u_emergency_override: false,
+        });
+        reviewSysId = reviewRecord?.sys_id ?? 'unknown';
+        console.log(`     u_ai_code_review record created: ${reviewSysId}`);
+      } else {
+        const groups = buildChunkPlan(issues);
+        console.log(`     Multi-part mode active. Creating ${groups.length} child review record(s).`);
+
+        for (const g of groups) {
+          const childSummary = [
+            `Chunked review for ${g.category} findings.`,
+            `Part ${g.part} of ${g.totalParts}.`,
+            `Contains ${g.issues.length} issue(s).`,
+          ].join(' ');
+
+          const childHtml = buildReviewHtml({
+            score,
+            recommendation,
+            good_points: [],
+            issues: g.issues,
+            jira_alignment,
+            summary: childSummary,
+          });
+
+          const childRecord = await snowPost('/table/u_ai_code_review', {
+            u_update_set: UPDATE_SET_SYS_ID,
+            u_review_engine: REVIEW_ENGINE,
+            u_description: childHtml.slice(0, 8000),
+            u_emergency_override: false,
+          });
+          const childId = childRecord?.sys_id || 'unknown';
+          childReviewIds.push(childId);
+          console.log(`     child review created: ${childId} (${g.category} ${g.part}/${g.totalParts})`);
+        }
+
+        const issueCountByCategory = new Map();
+        for (const issue of issues) {
+          const category = artifactCategoryFromLocation(issue?.location);
+          issueCountByCategory.set(category, (issueCountByCategory.get(category) || 0) + 1);
+        }
+        const categoryLines = Array.from(issueCountByCategory.entries())
+          .map(([cat, count]) => `- ${cat}: ${count} issue(s)`)
+          .join('\n');
+        const childLines = childReviewIds.map((id, i) => `${i + 1}. ${id}`).join('\n');
+
+        const summaryHtml = buildReviewHtml({
+          score,
+          recommendation,
+          good_points,
+          issues: [],
+          jira_alignment,
+          summary: [
+            summary,
+            '',
+            `This review was split into ${childReviewIds.length} child record(s) due to payload size constraints.`,
+            'Issue distribution by artifact category:',
+            categoryLines || '- None',
+            '',
+            'Child review sys_id list:',
+            childLines || 'None',
+          ].join('\n'),
+        });
+
+        const summaryRecord = await snowPost('/table/u_ai_code_review', {
+          u_update_set: UPDATE_SET_SYS_ID,
+          u_review_engine: REVIEW_ENGINE,
+          u_description: summaryHtml.slice(0, 8000),
+          u_emergency_override: false,
+        });
+        reviewSysId = summaryRecord?.sys_id ?? 'unknown';
+        console.log(`     summary review created: ${reviewSysId}`);
+      }
 
       // 3. Post a brief work note on the Update Set itself so it shows in the activity stream
       const badge = { PUSH: '[PASS]', 'PUSH WITH MINOR FIXES': '[WARN]', 'HOLD FOR REVIEW': '[HOLD]', 'DO NOT PUSH': '[FAIL]' }[recommendation] ?? '[?]';
       const briefNote = [
         `${badge} AI Code Review complete — Score: ${score}/100 — ${recommendation}`,
         `Full review details: navigate to Code Reviews and filter by this Update Set (record sys_id: ${reviewSysId}).`,
+        ...(childReviewIds.length ? [`Additional child reviews (${childReviewIds.length}): ${childReviewIds.join(', ')}`] : []),
         `Reviewed by: ${REVIEW_ENGINE} on ${new Date().toUTCString()}`,
       ].join('\n');
 
@@ -491,10 +668,12 @@ Review a ServiceNow Update Set and produce a decisional score on whether it is s
    -> Read name, description, scope
    -> Extract any Jira ticket ID from the description (pattern [A-Z]+-[0-9]+, e.g. TT-1234)
 2. Call get_update_set_changes
-   -> Returns metadata + short preview for every change
+  -> Returns metadata + short preview PAGE for code-containing changes
+  -> If has_more=true, call again with next_offset until done
    -> Identify all records where has_code=true
 3. For EACH record where has_code=true, call get_change_code(record_name) one at a time
-   -> Review the full code thoroughly against the checklist below
+  -> Review code thoroughly against the checklist below
+  -> If _meta.truncated_fields has entries, focus on critical logic and avoid requesting huge payloads repeatedly
 4. For Script Includes referenced in code but NOT in the Update Set, call get_existing_script_include
 5. If a Jira ticket ID was found, call get_jira_ticket
 6. Analyse everything thoroughly
@@ -578,6 +757,8 @@ console.log(`\n  AI Update Set Reviewer`);
 console.log(`  Update Set : ${UPDATE_SET_NAME || UPDATE_SET_SYS_ID}`);
 console.log(`  Instance   : ${SERVICENOW_INSTANCE}`);
 console.log(`  Engine     : ${REVIEW_ENGINE}`);
+console.log(`  Chunk Mode : ${FORCE_CHUNKED ? 'FORCED' : 'AUTO'}`);
+console.log(`  Chunk Size : ${CHUNK_SIZE}`);
 if (JIRA_TICKET) console.log(`  Jira Ticket: ${JIRA_TICKET}`);
 console.log();
 
@@ -621,6 +802,7 @@ while (iteration < MAX_ITERATIONS) {
     });
   } catch (apiErr) {
     if (apiErr?.status === 413 || apiErr?.error?.code === 'tokens_limit_reached') {
+      tokenLimitEvents++;
       console.warn('  [WARN] Token limit reached — truncating older tool results and retrying...');
       for (const m of messages) {
         if (m.role === 'tool' && typeof m.content === 'string' && m.content.length > 800) {
@@ -677,7 +859,7 @@ while (iteration < MAX_ITERATIONS) {
       console.error(`     ${result}`);
     }
 
-    messages.push({ role: 'tool', tool_call_id: toolCall.id, content: result, _iteration: iteration });
+    messages.push({ role: 'tool', tool_call_id: toolCall.id, content: normalizeToolResult(toolCall.function.name, result), _iteration: iteration });
   }
 }
 
@@ -688,6 +870,51 @@ if (iteration >= MAX_ITERATIONS) {
 // ── Safety net — always leave a trace if the review was never posted ──────────
 if (!reviewPosted) {
   console.error('  [ERROR] post_review_to_update_set was never called. Posting fallback error note to Update Set.');
+  if (tokenLimitEvents > 0) {
+    try {
+      const partialSummary = [
+        'Partial AI review: the agent hit model token/context limits while processing a large Update Set.',
+        'This is not a full-quality gate result.',
+        'Recommendation: split the Update Set or re-run review with smaller batches.',
+      ].join(' ');
+
+      const partialHtml = buildReviewHtml({
+        score: 55,
+        recommendation: 'HOLD FOR REVIEW',
+        good_points: ['Automated review started successfully.', 'Code changes were fetched and processing began.'],
+        issues: [{
+          severity: 'HIGH',
+          location: 'AI Review Pipeline',
+          description: 'Model context limit reached before final consolidated review could be posted.',
+          suggestion: 'Split the Update Set into smaller logical chunks and re-run the review.',
+        }],
+        summary: partialSummary,
+      });
+
+      const fallbackReview = await snowPost('/table/u_ai_code_review', {
+        u_update_set: UPDATE_SET_SYS_ID,
+        u_review_engine: REVIEW_ENGINE,
+        u_description: partialHtml.slice(0, 8000),
+        u_emergency_override: false,
+      });
+
+      await snowPatch(`/table/sys_update_set/${UPDATE_SET_SYS_ID}`, {
+        work_notes: [
+          '[AI Review] Partial review posted due to model token/context limits.',
+          `Recommendation: HOLD FOR REVIEW. Score: 55/100.`,
+          `u_ai_code_review sys_id: ${fallbackReview?.sys_id || 'unknown'}`,
+          'Action: split the Update Set into smaller batches and re-run the review.',
+          `Engine: ${REVIEW_ENGINE} | Time: ${new Date().toUTCString()}`,
+        ].join('\n'),
+      });
+
+      console.warn('  [WARN] Partial review posted due to token limits. Exiting without fatal failure.');
+      process.exit(0);
+    } catch (partialErr) {
+      console.error('  [ERROR] Failed to post partial review fallback:', partialErr.message);
+    }
+  }
+
   try {
     await snowPatch(`/table/sys_update_set/${UPDATE_SET_SYS_ID}`, {
       work_notes: [
